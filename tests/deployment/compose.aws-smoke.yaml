@@ -1,0 +1,23 @@
+# CI-only overlay for the production AWS services. There is no AWS, DNS, ACME,
+# or public listener: only the private proxy is exposed on the runner loopback.
+# Caddy's production configuration is validated separately without network access.
+services:
+  postgres:
+    volumes:
+      - type: volume
+        source: ci-postgres
+        target: /var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ../../backend
+      dockerfile: Dockerfile
+    environment:
+      FIELDMERGE_CORS_ORIGINS: '["http://127.0.0.1:18080"]'
+
+  api-proxy:
+    ports:
+      - "127.0.0.1:18080:8080"
+
+volumes:
+  ci-postgres:

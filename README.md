@@ -68,22 +68,27 @@ expanded in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Deployment
 
-The repository includes a deployment-ready GitHub Actions and Azure Container
-Apps path. It publishes immutable frontend and backend images, runs database
-migrations, deploys one warm web replica and one warm API replica, and verifies
-HTTP, PostgreSQL, and WebSocket behavior before accepting a release.
+The repository includes independent AWS and Azure deployment options. Both use
+GitHub Actions, immutable frontend and backend images, database migrations, and
+verification of HTTP, PostgreSQL, and WebSocket behavior before accepting a release.
 
-No cloud resources are created merely by cloning or running the project. Start
-with [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the complete beginner guide,
-including creating the public GitHub repository, configuring passwordless Azure
-access, finding the generated Azure URL, and adding
-`fieldmerge.irfanburakozer.com` with an Azure managed certificate.
+- [AWS deployment guide](docs/AWS_DEPLOYMENT.md): CloudFront, a private S3
+  frontend, and a separate warm EC2 server running the API and PostgreSQL.
+  Includes passwordless GitHub access, backups, and a staged custom-domain switch.
+- [Azure deployment guide](docs/DEPLOYMENT.md): Azure Container Apps with one
+  warm web replica and one warm API replica, plus private managed PostgreSQL.
+
+No cloud resources are created merely by cloning or running the project. Follow
+the guide for your chosen provider above. The AWS guide includes the staged move
+from an existing Azure deployment, with preview verification before switching
+`fieldmerge.irfanburakozer.com`. The Azure guide also covers first-time repository
+creation and Azure managed certificates.
 
 Secrets are not committed to this repository. Local `.env` files, virtual
 environments, dependencies, database files, and generated artifacts are ignored.
-The deployment script saves the database URL directly as a masked GitHub secret,
-and GitHub uses short-lived identity federation rather than a stored Azure
-password.
+Azure setup saves its database URL as a masked GitHub secret. AWS setup stores
+its separate runtime secrets in Systems Manager Parameter Store. GitHub uses
+short-lived identity federation for either cloud instead of stored cloud passwords.
 
 ## Run locally
 
@@ -204,18 +209,24 @@ docs/SYNC_CONTRACT.md     Operation and wire contract
 docs/ARCHITECTURE.md      Merge, persistence, and catch-up design
 docs/DEMO_GUIDE.md        One-minute recruiter walkthrough
 docs/DEPLOYMENT.md        GitHub, Azure, DNS, verification, and cleanup guide
+docs/AWS_DEPLOYMENT.md    Independent AWS deployment, DNS cutover, and recovery
 docs/SECURITY.md          Security boundaries and production checklist
 scripts/                  Local start, smoke, and benchmark commands
 .github/workflows/ci.yml  Backend, frontend, and container verification
 .github/workflows/deploy-production.yml  Immutable image publishing and Azure release
+.github/workflows/deploy-aws.yml  Opt-in AWS release of the exact tested commit
+.github/workflows/aws-assets.yml  AWS infrastructure and deployment regression checks
+infra/aws/               CloudFormation and single-host runtime configuration
+scripts/aws/             AWS setup, release, certificate, backup, and smoke checks
 ```
 
 ## Current scope
 
 The synchronization engine, two-device demo, persistence, compaction path,
 tests, local containers, CI, and bounded public-demo deployment configuration
-are included. The Azure resources and custom domain are created only when the
-owner follows the deployment guide.
+are included. Cloud resources and domain bindings are created only when the
+owner follows the selected deployment guide. AWS and Azure databases are separate;
+neither deployment silently migrates the other cloud's demo history.
 
 FieldMerge is not presented as a complete field-service product. The included
 cloud configuration is deliberately limited to one fixed fictional inspection.

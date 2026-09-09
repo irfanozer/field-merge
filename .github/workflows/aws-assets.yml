@@ -1,0 +1,188 @@
+name: AWS deployment assets
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fieldmerge-aws-assets-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate AWS templates and deployment safeguards
+    runs-on: ubuntu-latest
+    env:
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install template validation tools
+        run: |
+          python -m pip install "cfn-lint>=1,<2" "PyYAML>=6,<7"
+          python -m pip install --require-hashes --requirement backend/requirements-dev.lock
+
+      - name: Validate CloudFormation
+        run: cfn-lint infra/aws/foundation.yaml
+
+      - name: Check AWS Python formatting and lint
+        run: |
+          ruff format --check scripts/aws tests/deployment
+          ruff check scripts/aws tests/deployment
+
+      - name: Check shell syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in scripts/aws/*.sh; do
+            bash -n "$script"
+          done
+
+      - name: Check PowerShell syntax
+        shell: pwsh
+        run: |
+          $errors = @()
+          Get-ChildItem -Path scripts/aws, tests/deployment -Recurse -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref] $tokens,
+              [ref] $parseErrors
+            ) | Out-Null
+            $errors += $parseErrors
+          }
+          if ($errors.Count -gt 0) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }
+
+      - name: Verify deployment safeguards
+        run: python -m unittest discover -s tests/deployment -v
+
+      - name: Test AWS CLI output handling without AWS access
+        shell: pwsh
+        run: ./tests/deployment/test_aws_powershell.ps1 -PythonExecutable (Get-Command python).Source
+
+      - name: Test GitHub environment setup without cloud access
+        shell: pwsh
+        run: ./tests/deployment/test_github_oidc_powershell.ps1 -PythonExecutable (Get-Command python).Source
+
+      - name: Test browser Origin verification against a local WebSocket fixture
+        shell: pwsh
+        run: ./tests/deployment/test_websocket_powershell.ps1 -PythonExe (Get-Command python).Source
+
+      - name: Validate proxy configurations without AWS access
+        shell: bash
+        env:
+          # Synthetic configuration only; this job needs no deployment secrets.
+          BACKEND_IMAGE: ghcr.io/irfanozer/field-merge-backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          POSTGRES_PASSWORD: "00000000000000000000000000000000"
+          ORIGIN_DOMAIN: origin.example.com
+          ORIGIN_VERIFY_TOKEN: "00000000000000000000000000000000"
+          PUBLIC_ORIGIN: https://preview.example.com
+        run: |
+          set -euo pipefail
+          docker compose --file infra/aws/compose.yaml config --quiet
+          caddy_image=$(python -c 'import yaml; print(yaml.safe_load(open("infra/aws/compose.yaml"))["services"]["caddy"]["image"])')
+          nginx_image=$(python -c 'import yaml; print(yaml.safe_load(open("infra/aws/compose.yaml"))["services"]["api-proxy"]["image"])')
+          docker pull "$caddy_image"
+          docker pull "$nginx_image"
+          # Configuration processes have no network, so they cannot contact ACME,
+          # an application/database, AWS, or any other external service.
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:size=16m --tmpfs /data:size=16m --tmpfs /config:size=4m \
+            --env ORIGIN_DOMAIN --env ORIGIN_VERIFY_TOKEN \
+            --mount "type=bind,source=$PWD/infra/aws/Caddyfile,target=/etc/caddy/Caddyfile,readonly" \
+            "$caddy_image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:size=16m,mode=1777 --cap-drop ALL \
+            --security-opt no-new-privileges:true --entrypoint nginx \
+            --mount "type=bind,source=$PWD/infra/aws/api-proxy.conf,target=/etc/nginx/nginx.conf,readonly" \
+            "$nginx_image" -t
+
+  runtime-smoke:
+    name: Test AWS PostgreSQL and WebSocket proxy runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AWS_EC2_METADATA_DISABLED: "true"
+      COMPOSE_PROJECT_NAME: fieldmerge-aws-ci
+      BACKEND_IMAGE: fieldmerge-backend:aws-ci
+      POSTGRES_PASSWORD: "00000000000000000000000000000000"
+      ORIGIN_DOMAIN: origin.example.com
+      ORIGIN_VERIFY_TOKEN: "00000000000000000000000000000000"
+      PUBLIC_ORIGIN: http://127.0.0.1:18080
+      FIELDMERGE_SMOKE_URL: http://127.0.0.1:18080
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install locked HTTP and WebSocket verification dependencies
+        run: python -m pip install --require-hashes --requirement backend/requirements-dev.lock
+
+      - name: Build the application and migrate the isolated AWS-shaped database
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f infra/aws/compose.yaml -f tests/deployment/compose.aws-smoke.yaml config --quiet
+          docker compose -f infra/aws/compose.yaml -f tests/deployment/compose.aws-smoke.yaml build backend
+          docker compose -f infra/aws/compose.yaml -f tests/deployment/compose.aws-smoke.yaml up --detach --wait --wait-timeout 120 postgres
+          docker compose -f infra/aws/compose.yaml -f tests/deployment/compose.aws-smoke.yaml run --rm migrate
+          docker compose -f infra/aws/compose.yaml -f tests/deployment/compose.aws-smoke.yaml up --detach --wait --wait-timeout 180 backend api-proxy
+
+      - name: Verify actual proxy upgrades, approved Origin, persisted state, and denied Origin
+        run: python tests/deployment/runtime_proxy_smoke.py
+
+      - name: Inspect and remove only the isolated CI runtime
+        if: always()
+        shell: bash
+        run: |
+          docker compose -f infra/aws/compose.yaml -f tests/deployment/compose.aws-smoke.yaml ps
+          docker compose -f infra/aws/compose.yaml -f tests/deployment/compose.aws-smoke.yaml logs --no-color --tail 120 postgres backend api-proxy
+          docker compose -f infra/aws/compose.yaml -f tests/deployment/compose.aws-smoke.yaml down --volumes
+
+  windows-powershell:
+    name: Test Windows PowerShell 5.1 compatibility
+    runs-on: windows-latest
+    env:
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Test native output handling in Windows PowerShell
+        shell: powershell
+        run: ./tests/deployment/test_aws_powershell.ps1 -PythonExecutable (Get-Command python).Source
+
+      - name: Install the pinned local WebSocket fixture dependency
+        run: python -m pip install "websockets==17.1"
+
+      - name: Test GitHub environment setup in Windows PowerShell
+        shell: powershell
+        run: ./tests/deployment/test_github_oidc_powershell.ps1 -PythonExecutable (Get-Command python).Source
+
+      - name: Test browser Origin verification in Windows PowerShell
+        shell: powershell
+        run: ./tests/deployment/test_websocket_powershell.ps1 -PythonExe (Get-Command python).Source
