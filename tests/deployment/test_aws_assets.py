@@ -381,10 +381,14 @@ class RuntimeSafetyTests(unittest.TestCase):
             with self.subTest(service=name):
                 self.assertFalse(services[name].get("ports"))
                 self.assertNotEqual(services[name].get("network_mode"), "host")
-        database_networks = services["postgres"]["networks"]
-        self.assertTrue(database_networks)
-        for network in database_networks:
-            self.assertIs(self.compose["networks"][network].get("internal"), True)
+                networks = services[name]["networks"]
+                self.assertTrue(networks)
+                self.assertNotIn("ci-runner", networks)
+                for network in networks:
+                    self.assertIs(
+                        self.compose["networks"][network].get("internal"), True
+                    )
+        self.assertNotIn("ci-runner", self.compose["networks"])
 
     def test_database_and_tls_state_use_preexisting_durable_mounts(self):
         expected_mounts = {
@@ -461,10 +465,35 @@ class RuntimeSafetyTests(unittest.TestCase):
     def test_runtime_smoke_overlay_cannot_publish_database_or_backend(self):
         overlay = load_yaml(ROOT / "tests/deployment/compose.aws-smoke.yaml")
         for name in ("postgres", "backend", "migrate"):
-            self.assertFalse(overlay["services"].get(name, {}).get("ports"))
+            with self.subTest(service=name):
+                overrides = overlay["services"].get(name, {})
+                self.assertFalse(overrides.get("ports"))
+                self.assertNotIn("network_mode", overrides)
+                self.assertEqual(
+                    set(overrides.get("networks", ["application"])), {"application"}
+                )
         self.assertEqual(
             overlay["services"]["api-proxy"]["ports"], ["127.0.0.1:18080:8080"]
         )
+
+    def test_runner_facing_network_is_ci_only_and_attached_only_to_proxy(self):
+        overlay = load_yaml(ROOT / "tests/deployment/compose.aws-smoke.yaml")
+        # Never make a production network external to fix runner port publishing.
+        self.assertEqual(set(overlay["networks"]), {"ci-runner"})
+        runner_network = overlay["networks"]["ci-runner"]
+        self.assertEqual(runner_network["driver"], "bridge")
+        self.assertIs(runner_network["internal"], False)
+        self.assertFalse(runner_network.get("external"))
+        self.assertEqual(
+            set(overlay["services"]["api-proxy"]["networks"]),
+            {"application", "origin-proxy", "ci-runner"},
+        )
+        runner_members = {
+            name
+            for name, service in overlay["services"].items()
+            if "ci-runner" in service.get("networks", [])
+        }
+        self.assertEqual(runner_members, {"api-proxy"})
 
 
 class WorkflowGateTests(unittest.TestCase):
@@ -562,6 +591,51 @@ class WorkflowGateTests(unittest.TestCase):
         self.assertIn("run --rm migrate", commands)
         self.assertIn("backend api-proxy", commands)
         self.assertIn("runtime_proxy_smoke.py", commands)
+
+    def test_runner_port_and_readiness_preflight_precedes_write_smoke(self):
+        with (ROOT / ".github/workflows/aws-assets.yml").open(
+            encoding="utf-8"
+        ) as stream:
+            workflow = yaml.load(stream, Loader=yaml.BaseLoader)
+        runtime = workflow["jobs"]["runtime-smoke"]
+        self.assertEqual(
+            runtime["env"]["FIELDMERGE_SMOKE_URL"], "http://127.0.0.1:18080"
+        )
+        steps = runtime["steps"]
+        startup_index = next(
+            index
+            for index, step in enumerate(steps)
+            if "up --detach --wait" in step.get("run", "")
+            and "backend api-proxy" in step["run"]
+        )
+        preflight_index = next(
+            index
+            for index, step in enumerate(steps)
+            if "port api-proxy 8080" in step.get("run", "")
+        )
+        smoke_index = next(
+            index
+            for index, step in enumerate(steps)
+            if "runtime_proxy_smoke.py" in step.get("run", "")
+        )
+        self.assertLess(startup_index, preflight_index)
+        self.assertLess(preflight_index, smoke_index)
+        preflight = steps[preflight_index]
+        self.assertEqual(preflight["shell"], "bash")
+        self.assertNotIn("if", preflight)
+        self.assertNotEqual(preflight.get("continue-on-error"), "true")
+        commands = preflight["run"]
+        self.assertIn("set -euo pipefail", commands)
+        self.assertIn("-f infra/aws/compose.yaml", commands)
+        self.assertIn("-f tests/deployment/compose.aws-smoke.yaml", commands)
+        self.assertRegex(commands, r'!=\s+"127\.0\.0\.1:18080"')
+        self.assertIn("exit 1", commands)
+        self.assertIn("curl --fail --silent --show-error", commands)
+        self.assertIn("--connect-timeout 5", commands)
+        self.assertIn("--max-time 15", commands)
+        self.assertIn("for path in /healthz /health/ready", commands)
+        self.assertIn('"${FIELDMERGE_SMOKE_URL}${path}"', commands)
+        self.assertLess(commands.index("port api-proxy 8080"), commands.index("curl "))
 
     def test_custom_domain_smoke_requires_explicit_manual_post_cutover_opt_in(self):
         inputs = self.workflow["on"]["workflow_dispatch"]["inputs"]

@@ -16,8 +16,16 @@ services:
       FIELDMERGE_CORS_ORIGINS: '["http://127.0.0.1:18080"]'
 
   api-proxy:
+    # Docker does not activate published ports on all-internal networks. Give
+    # only this CI proxy a runner-facing bridge; its host port stays loopback-only.
+    networks: [application, origin-proxy, ci-runner]
     ports:
       - "127.0.0.1:18080:8080"
+
+networks:
+  ci-runner:
+    driver: bridge
+    internal: false
 
 volumes:
   ci-postgres:

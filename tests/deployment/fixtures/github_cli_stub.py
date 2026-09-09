@@ -34,12 +34,34 @@ def emit(payload: object) -> int:
 def main() -> int:
     case = os.environ["FIELDMERGE_GITHUB_TEST_CASE"]
     tool, *arguments = sys.argv[1:]
-    stdin = sys.stdin.read() if "--input" in arguments else ""
+    input_path = None
+    input_bytes = b""
+    if "--input" in arguments:
+        input_argument = arguments[arguments.index("--input") + 1]
+        if input_argument == "-":
+            input_bytes = sys.stdin.buffer.read()
+        else:
+            input_path = Path(input_argument)
+            fixture_directory = Path(os.environ["FIELDMERGE_GITHUB_TEST_LOG"]).parent
+            if input_path.resolve().parent != fixture_directory.resolve():
+                raise ValueError(
+                    "JSON input must stay inside the isolated fixture directory"
+                )
+            input_bytes = input_path.read_bytes()
+    # Deliberately strict: do not accept a BOM or silently replace malformed bytes.
+    stdin = input_bytes.decode("utf-8")
     method = (
         arguments[arguments.index("--method") + 1] if "--method" in arguments else "GET"
     )
     write = tool == "gh" and (method != "GET" or arguments[:2] == ["variable", "set"])
-    call = {"tool": tool, "arguments": arguments, "stdin": stdin, "write": write}
+    call = {
+        "tool": tool,
+        "arguments": arguments,
+        "stdin": stdin,
+        "input_path": str(input_path) if input_path is not None else None,
+        "input_prefix_hex": input_bytes[:8].hex(),
+        "write": write,
+    }
     with Path(os.environ["FIELDMERGE_GITHUB_TEST_LOG"]).open(
         "a", encoding="utf-8"
     ) as log:
@@ -139,7 +161,10 @@ def main() -> int:
         elif case == "wrong-type":
             policies = [{"name": "main", "type": "tag"}]
         return emit({"branch_policies": policies})
-    if arguments == ["api", "--method", "PUT", ENVIRONMENT, "--input", "-"]:
+    if (
+        arguments[:5] == ["api", "--method", "PUT", ENVIRONMENT, "--input"]
+        and len(arguments) == 6
+    ):
         if json.loads(stdin) != {"deployment_branch_policy": POLICY}:
             raise ValueError(
                 "Environment creation must send exactly the selected-branch policy"

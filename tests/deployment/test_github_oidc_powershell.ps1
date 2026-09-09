@@ -23,7 +23,8 @@ function aws {
 }
 
 function gh {
-    if (@($args) -contains "--input") {
+    $inputIndex = [Array]::IndexOf([object[]] $args, "--input")
+    if ($inputIndex -ge 0 -and $args[$inputIndex + 1] -eq "-") {
         $input | & $FixturePython $FixturePath gh @args
     }
     else {
@@ -72,7 +73,7 @@ function Invoke-ConfigurationCase {
     Assert-True (@($calls | Where-Object tool -eq "aws").Count -eq 1) "Only the read-only fixture stack lookup is allowed."
     Assert-True (@($calls | Where-Object { $_.arguments -contains "AWS_DEPLOYMENT_ENABLED" }).Count -eq 0) "Deployment must remain disabled without its explicit switch."
     if ($caught) {
-        Assert-True ($caught.Exception.Message -notmatch "OFFLINE-FIXTURE-REJECTED") "The script made an unexpected CLI request."
+        Assert-True ($caught.Exception.Message -notmatch "OFFLINE-FIXTURE-REJECTED") "The script made an unexpected CLI request: $($caught.Exception.Message)"
     }
     return [pscustomobject]@{ Error = $caught; Calls = $calls }
 }
@@ -106,14 +107,27 @@ function Assert-NoWrites {
 }
 
 $savedEnvironment = @{}
-foreach ($name in @("FIELDMERGE_GITHUB_TEST_CASE", "FIELDMERGE_GITHUB_TEST_LOG", "TEMP", "TMP", "TMPDIR", "AWS_PAGER")) {
+foreach ($name in @("FIELDMERGE_GITHUB_TEST_CASE", "FIELDMERGE_GITHUB_TEST_LOG", "TEMP", "TMP", "TMPDIR", "AWS_PAGER", "PYTHONIOENCODING", "PYTHONUTF8")) {
     $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
 }
+$previousConsoleInputEncoding = [Console]::InputEncoding
+$previousConsoleOutputEncoding = [Console]::OutputEncoding
+$previousOutputEncoding = $OutputEncoding
+$previousParameterDefaults = $PSDefaultParameterValues
 $originalTempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $script:FixtureDirectory = Join-Path $originalTempRoot "fieldmerge github fixture $([Guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Path $script:FixtureDirectory | Out-Null
 
 try {
+    # Reproduce the runner's BOM-emitting console profile. Native JSON requests
+    # must work independently of console/pipeline encodings, including on PS5.1.
+    $env:PYTHONIOENCODING = "utf-8"
+    $env:PYTHONUTF8 = "1"
+    $OutputEncoding = [Text.Encoding]::UTF8
+    [Console]::InputEncoding = [Text.Encoding]::UTF8
+    [Console]::OutputEncoding = [Text.Encoding]::UTF8
+    $PSDefaultParameterValues = $PSDefaultParameterValues.Clone()
+    $PSDefaultParameterValues["*:Encoding"] = "utf8"
     $env:TEMP = $script:FixtureDirectory
     $env:TMP = $script:FixtureDirectory
     $env:TMPDIR = $script:FixtureDirectory
@@ -128,6 +142,10 @@ try {
             $writes = @($result.Calls | Where-Object write -eq $true)
             Assert-True ($writes.Count -eq 5) "Creation must perform exactly two protection writes and three variable writes."
             Assert-True ($writes[0].arguments[2] -eq "PUT") "The environment must be created first."
+            Assert-True ($null -ne $writes[0].input_path) "JSON must be supplied through a deterministic UTF-8 file, not native stdin."
+            Assert-True ($writes[0].input_path -like "*fieldmerge github fixture *") "The JSON file must support a temporary path containing spaces."
+            Assert-True ($writes[0].input_prefix_hex.StartsWith("7b")) "The request JSON must start with its object, without a BOM."
+            Assert-True (-not (Test-Path -LiteralPath $writes[0].input_path)) "The temporary GitHub JSON request must be removed after success."
             $body = $writes[0].stdin | ConvertFrom-Json
             Assert-True ($body.deployment_branch_policy.protected_branches -eq $false) "Protected branches alone do not guarantee main-only deployment."
             Assert-True ($body.deployment_branch_policy.custom_branch_policies -eq $true) "Selected branch policies must be enabled."
@@ -165,6 +183,8 @@ try {
             $expectedWrites = if ($case -eq "create-fails") { 1 } else { 2 }
             Assert-True ($writes.Count -eq $expectedWrites) "Execution did not stop immediately after the failed protection write."
             Assert-True (@($writes | Where-Object { $_.arguments[0] -eq "variable" }).Count -eq 0) "Variables must not be written after a creation failure."
+            Assert-True ($null -ne $writes[0].input_path) "Failed requests must also use the temporary JSON file."
+            Assert-True (-not (Test-Path -LiteralPath $writes[0].input_path)) "The temporary GitHub JSON request must be removed after failure."
         }
     }
 
@@ -191,6 +211,10 @@ try {
     }
 }
 finally {
+    [Console]::InputEncoding = $previousConsoleInputEncoding
+    [Console]::OutputEncoding = $previousConsoleOutputEncoding
+    $OutputEncoding = $previousOutputEncoding
+    $PSDefaultParameterValues = $previousParameterDefaults
     foreach ($name in $savedEnvironment.Keys) {
         [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name])
     }

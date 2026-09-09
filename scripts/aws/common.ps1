@@ -57,20 +57,29 @@ function Invoke-FieldMergeGitHub {
     # 5.1, merged native stderr would throw before we can inspect its exit code.
     Get-Command gh -ErrorAction Stop | Out-Null
     $PSNativeCommandUseErrorActionPreference = $false
-    # Windows PowerShell otherwise encodes native stdin as ASCII. This variable
-    # is function-local, so the caller's encoding remains unchanged.
-    $OutputEncoding = [Text.UTF8Encoding]::new($false)
+    # Do not pipe JSON to native stdin: the runner's Windows PowerShell console
+    # encoding can add a UTF-8 BOM even when OutputEncoding requests no BOM.
+    # Keep the caller's --input - contract, but give gh an exact UTF-8 file.
     $stderrPath = [IO.Path]::GetTempFileName()
+    $requestPath = $null
     $callerErrorPreference = $ErrorActionPreference
     try {
+        $nativeArguments = @($Arguments)
+        if ($PSBoundParameters.ContainsKey("InputJson")) {
+            $inputIndexes = @(for ($index = 0; $index -lt $nativeArguments.Count; $index++) {
+                if ($nativeArguments[$index] -eq "--input") { $index }
+            })
+            if ($inputIndexes.Count -ne 1 -or $inputIndexes[0] + 1 -ge $nativeArguments.Count -or
+                $nativeArguments[$inputIndexes[0] + 1] -ne "-") {
+                throw "InputJson requires exactly one --input - argument."
+            }
+            $requestPath = [IO.Path]::GetTempFileName()
+            [IO.File]::WriteAllText($requestPath, $InputJson, [Text.UTF8Encoding]::new($false))
+            $nativeArguments[$inputIndexes[0] + 1] = $requestPath
+        }
         try {
             $ErrorActionPreference = "Continue"
-            if ($PSBoundParameters.ContainsKey("InputJson")) {
-                $result = $InputJson | & gh @Arguments 2> $stderrPath
-            }
-            else {
-                $result = & gh @Arguments 2> $stderrPath
-            }
+            $result = & gh @nativeArguments 2> $stderrPath
             $exitCode = $LASTEXITCODE
         }
         finally { $ErrorActionPreference = $callerErrorPreference }
@@ -79,6 +88,7 @@ function Invoke-FieldMergeGitHub {
     finally {
         $ErrorActionPreference = $callerErrorPreference
         if (Test-Path -LiteralPath $stderrPath) { Remove-Item -LiteralPath $stderrPath -Force }
+        if ($requestPath -and (Test-Path -LiteralPath $requestPath)) { Remove-Item -LiteralPath $requestPath -Force }
     }
     $resultText = ($result | ForEach-Object { "$_" }) -join "`n"
     if ($exitCode -ne 0) {

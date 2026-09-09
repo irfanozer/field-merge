@@ -147,6 +147,20 @@ jobs:
           docker compose -f infra/aws/compose.yaml -f tests/deployment/compose.aws-smoke.yaml run --rm migrate
           docker compose -f infra/aws/compose.yaml -f tests/deployment/compose.aws-smoke.yaml up --detach --wait --wait-timeout 180 backend api-proxy
 
+      - name: Verify the proxy is reachable from the runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          published_proxy="$(docker compose -f infra/aws/compose.yaml -f tests/deployment/compose.aws-smoke.yaml port api-proxy 8080)"
+          if [[ "$published_proxy" != "127.0.0.1:18080" ]]; then
+            echo "The CI proxy port is not published on 127.0.0.1:18080. Check the CI runner network." >&2
+            exit 1
+          fi
+          for path in /healthz /health/ready; do
+            curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+              --output /dev/null "${FIELDMERGE_SMOKE_URL}${path}"
+          done
+
       - name: Verify actual proxy upgrades, approved Origin, persisted state, and denied Origin
         run: python tests/deployment/runtime_proxy_smoke.py
 
