@@ -173,3 +173,5 @@ finally {
 
 Write-Host "Passed: $script:Passed. Failed: $script:Failed."
 if ($script:Failed -gt 0) { exit 1 }
+# Report the test result explicitly instead of an inherited native exit code.
+exit 0
