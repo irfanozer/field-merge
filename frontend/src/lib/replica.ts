@@ -37,6 +37,7 @@ export function createReplica(
     digest: snapshot?.state_digest ?? null,
     lastSyncAt: snapshot ? new Date().toISOString() : null,
     lastSyncMode: snapshot ? "incremental" : null,
+    conflicts: snapshot?.conflicts ?? [],
   };
 }
 
@@ -91,6 +92,13 @@ export function applySyncResponse(replica: Replica, response: SyncResponse): Rep
   // final overlay avoids duplicating backend merge policy in an untrusted browser.
   const materializedState = { ...snapshotBase.state, ...response.state };
   const materializedVector = { ...snapshotBase.vector, ...response.version_vector };
+  for (const operation of remaining) {
+    materializedState[operation.field] = operation.value;
+    materializedVector[operation.actor_id] = Math.max(
+      materializedVector[operation.actor_id] ?? 0,
+      operation.actor_counter,
+    );
+  }
 
   return {
     ...replica,
@@ -101,7 +109,8 @@ export function applySyncResponse(replica: Replica, response: SyncResponse): Rep
       (response.version_vector[replica.actorId] ?? 0) + 1,
     ),
     pending: remaining,
-    digest: response.state_digest,
+    digest: remaining.length ? null : response.state_digest,
+    conflicts: response.conflicts,
     lastSyncAt: new Date().toISOString(),
     lastSyncMode: response.sync_mode,
   };

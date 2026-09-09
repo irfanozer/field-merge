@@ -14,28 +14,49 @@ function apiUrl(path: string): string {
   return `${configuredBase}${path}`;
 }
 
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(apiUrl(path), {
-    ...init,
-    headers: {
-      Accept: "application/json",
-      ...(init?.body ? { "Content-Type": "application/json" } : {}),
-      ...init?.headers,
-    },
-  });
-
-  if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
-    try {
-      const body = (await response.json()) as { detail?: string };
-      if (body.detail) detail = body.detail;
-    } catch {
-      // The status line remains the most useful fallback for a non-JSON failure.
-    }
-    throw new Error(detail);
+export class ApiError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
   }
+}
 
-  return (await response.json()) as T;
+async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(apiUrl(path), {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...init?.headers,
+      },
+    });
+
+    if (!response.ok) {
+      let detail = `${response.status} ${response.statusText}`;
+      try {
+        const body = (await response.json()) as { detail?: unknown };
+        if (body.detail) detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      } catch {
+        // The status line remains the most useful fallback for a non-JSON failure.
+      }
+      throw new ApiError(response.status, detail);
+    }
+
+    return (await response.json()) as T;
+  } catch (cause) {
+    if (controller.signal.aborted) {
+      throw new Error("The server took too long to respond. Your saved edits are still on the tablet. Try sending again.");
+    }
+    throw cause;
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
 
 function normalizeState(value: unknown): InspectionState {

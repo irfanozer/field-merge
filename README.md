@@ -7,13 +7,13 @@ changes to the server, keeps either note from silently overwriting the other,
 and asks a person to approve the final wording when the notes disagree.
 
 The public demonstration places two test tablets side by side in one browser so
-the complete journey is easy to follow. The tablets losing signal is a guided
-test scenario. The offline queues, FastAPI requests, PostgreSQL writes,
+the complete journey is easy to follow. Tablet connections are simulated;
+you write and save the notes yourself. The offline queues, FastAPI requests, PostgreSQL writes,
 conflict handling, and live updates are real application behavior.
 
-## What the guided demo shows
+## Try the hands-on demo
 
-The guided run follows one shared pump inspection:
+The page opens directly on two tablet editors for one shared pump inspection:
 
 1. Both test tablets receive the same report from PostgreSQL.
 2. Each worker saves a different note while their tablet is offline.
@@ -24,9 +24,11 @@ The guided run follows one shared pump inspection:
 6. The server sends that approved report to both tablets and the page verifies
    that all three saved copies match.
 
-Use **Go to the guided demo**, then **Start the guided demo**. Steps 1-3 run
-automatically. At step 4, review the two notes and select **Save final report and
-update both tablets**. A more detailed one-minute walkthrough is available in
+Write your own note on each tablet and press **Save on this tablet**. Nothing
+is sent yet. Select **Reconnect & send notes**, review the saved notes, and
+choose **Save & update both tablets**. The progress tracker and request path
+stay visible; detailed receipts and history are under **See how the backend works**.
+Reloading reads the existing report without resetting its history. A walkthrough is available in
 [`docs/DEMO_GUIDE.md`](docs/DEMO_GUIDE.md).
 
 ## Architecture

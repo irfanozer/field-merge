@@ -19,7 +19,7 @@ export function Timeline({ entries }: TimelineProps) {
       {entries.length === 0 ? (
         <div className="timeline-empty">
           <span>01</span>
-          <p>Start the guided demo. Each offline save, reconnect, server write, review step, and final update will appear here.</p>
+          <p>Your local saves and completed sync requests will appear here.</p>
         </div>
       ) : (
         <ol className="timeline-list">

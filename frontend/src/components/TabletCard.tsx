@@ -1,184 +1,107 @@
-import type { FormEvent } from "react";
-import type { EditableField, FieldConflict, Replica } from "../types";
-import { shortDigest, vectorLabel } from "../lib/replica";
+import { useState, type FormEvent } from "react";
+import type { EditableField, Replica } from "../types";
+
+export interface TabletEdit { field: EditableField; value: string }
 
 interface TabletCardProps {
   replica: Replica;
-  conflicts: FieldConflict[];
-  active?: boolean;
   busy: boolean;
-  onToggleConnection: (online: boolean) => void;
-  onSync: () => void;
-  onEdit: (field: EditableField, value: string) => void;
+  ready: boolean;
+  complete: boolean;
+  onSave: (edits: TabletEdit[]) => void;
+  onDraftChange: (dirty: boolean) => void;
 }
 
-const priorities = ["Routine", "Watch", "Urgent"];
-const statuses = ["Inspection in progress", "Needs follow-up", "Ready for service"];
+export function TabletCard({ replica, busy, ready, complete, onSave, onDraftChange }: TabletCardProps) {
+  const [note, setNote] = useState(() => replica.pending.filter((op) => op.field === "observation").at(-1)?.value ?? "");
+  const [priority, setPriority] = useState(replica.state.priority);
+  const [status, setStatus] = useState(replica.state.status);
+  const [saved, setSaved] = useState(replica.pending.length > 0);
+  const [message, setMessage] = useState("");
+  const north = replica.actorId === "tablet-north";
+  const conflict = replica.conflicts?.find((item) => item.field === "observation");
 
-export function TabletCard({
-  replica,
-  conflicts,
-  active = false,
-  busy,
-  onToggleConnection,
-  onSync,
-  onEdit,
-}: TabletCardProps) {
-  const observationConflict = conflicts.find((conflict) => conflict.field === "observation");
+  function changed(nextNote: string, nextPriority: string, nextStatus: string) {
+    onDraftChange(Boolean(
+      (nextNote.trim() && nextNote.trim() !== replica.state.observation) ||
+      nextPriority !== replica.state.priority || nextStatus !== replica.state.status,
+    ));
+    setMessage("");
+  }
 
-  function submitObservation(event: FormEvent<HTMLFormElement>) {
+  function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
-    const next = String(data.get("observation") ?? "").trim();
-    if (!next || next === replica.state.observation) return;
-    onEdit("observation", next);
+    const edits: TabletEdit[] = [];
+    if (note.trim() && note.trim() !== replica.state.observation) edits.push({ field: "observation", value: note.trim() });
+    if (priority !== replica.state.priority) edits.push({ field: "priority", value: priority });
+    if (status !== replica.state.status) edits.push({ field: "status", value: status });
+    if (!edits.length) {
+      setMessage(saved ? "No new changes to save." : "Write a new note before saving.");
+      return;
+    }
+    onSave(edits);
+    onDraftChange(false);
+    setSaved(true);
+    setMessage("Saved on this tablet. It has not been sent yet.");
   }
 
   return (
-    <article
-      className={`tablet-card tablet-card--${replica.actorId === "tablet-north" ? "north" : "south"}${active ? " tablet-card--active" : ""}`}
-      aria-label={`${replica.label} replica`}
-    >
-      <header className="tablet-card__header">
-        <div>
-          <p className="eyebrow">Worker&apos;s tablet · {replica.location}</p>
-          <h3>{replica.label}</h3>
-        </div>
-        <button
-          className={`connection-switch ${replica.online ? "is-online" : "is-offline"}`}
-          type="button"
-          role="switch"
-          aria-checked={replica.online}
-          aria-label={`${replica.label} network connection`}
-          disabled={busy}
-          onClick={() => onToggleConnection(!replica.online)}
-        >
-          <span aria-hidden="true" />
-          {replica.online ? "Online" : "Offline"}
-        </button>
-      </header>
-
-      <div className="tablet-card__screen">
-        <div className="record-heading">
-          <div>
-            <span>Inspection report</span>
-            <strong>PUMP-07</strong>
-          </div>
-          <span className={`queue-pill ${replica.pending.length ? "has-items" : ""}`}>
-            {replica.pending.length
-              ? `${replica.pending.length} ${replica.pending.length === 1 ? "edit" : "edits"} waiting to send`
-              : "All edits sent"}
+    <article className={`tablet tablet--${north ? "north" : "south"}`} aria-label={replica.label}>
+      <div className="tablet__camera" aria-hidden="true" />
+      <div className="tablet__screen">
+        <header className="tablet__header">
+          <div><span className="eyebrow">{replica.location}</span><h3>{replica.label}</h3></div>
+          <span className={`connection-label ${replica.online ? "online" : "offline"}`}>
+            <i aria-hidden="true" />{replica.online ? "Connected" : "Offline"}
           </span>
-        </div>
-
-        <dl className="record-grid">
-          <div>
-            <dt>Site</dt>
-            <dd>{replica.state.site_name}</dd>
-          </div>
-          <div>
-            <dt>Priority</dt>
-            <dd>{replica.state.priority}</dd>
-          </div>
-          <div>
-            <dt>Status</dt>
-            <dd>{replica.state.status}</dd>
-          </div>
-        </dl>
-
-        <section className={`observation-box ${observationConflict ? "has-conflict" : ""}`}>
-          <div className="observation-box__label">
-            <span>Worker&apos;s inspection note</span>
-            {observationConflict && <strong>Both offline notes saved</strong>}
-          </div>
-          <p>{observationConflict ? "Two notes are waiting for your review." : (replica.state.observation ?? "No note yet.")}</p>
-          {observationConflict && (
-            <ul className="candidate-mini-list">
-              {observationConflict.candidates.map((candidate) => (
-                <li key={candidate.operation_id}>
-                  <span>{candidate.actor_id.replace("tablet-", "Tablet ")}</span>
-                  {candidate.value}
-                </li>
-              ))}
-            </ul>
+        </header>
+        <div className="tablet__body">
+          <p className="tablet__record">PUMP-07 <span>Inspection note</span></p>
+          {complete || conflict ? (
+            <div className="tablet__report">
+              <span className="eyebrow">{conflict ? "Downloaded from the server" : "Shared report"}</span>
+              {conflict ? <>
+                <h4>Both notes arrived.</h4>
+                <p>They describe the same inspection differently. Choose the shared wording below.</p>
+                <a className="button button--secondary" href="#resolution-panel">Review both notes ↓</a>
+              </> : <><p className="final-note">{replica.state.observation}</p><span className="saved-label">✓ Matches the server</span></>}
+            </div>
+          ) : (
+            <form onSubmit={save}>
+              <label htmlFor={`${replica.actorId}-note`}>What did you notice?</label>
+              <textarea
+                id={`${replica.actorId}-note`}
+                value={note}
+                onChange={(event) => { setNote(event.target.value); changed(event.target.value, priority, status); }}
+                placeholder={north ? "For example: water is leaking near the seal." : "For example: the motor is vibrating more than usual."}
+                rows={4}
+                maxLength={2000}
+                disabled={busy || !ready}
+              />
+              <details className="tablet__fields">
+                <summary>Priority and status</summary>
+                <div className="field-pair">
+                  <label>Priority<select value={priority} disabled={busy || !ready} onChange={(event) => { setPriority(event.target.value); changed(note, event.target.value, status); }}>
+                    {[...new Set([replica.state.priority, "Routine", "High", "Watch", "Urgent"])].map((value) => <option key={value}>{value}</option>)}
+                  </select></label>
+                  <label>Status<select value={status} disabled={busy || !ready} onChange={(event) => { setStatus(event.target.value); changed(note, priority, event.target.value); }}>
+                    {[...new Set([replica.state.status, "Inspection in progress", "Needs follow-up", "Ready for service"])].map((value) => <option key={value}>{value}</option>)}
+                  </select></label>
+                </div>
+              </details>
+              <button className="button button--tablet" type="submit" disabled={busy || !ready}>
+                {busy ? "Sync in progress…" : "Save on this tablet"}
+              </button>
+              <p className="save-feedback" role="status">{message || (saved ? "Saved here. Ready to send." : "Type your own note. Examples are not added for you.")}</p>
+            </form>
           )}
-        </section>
-
-        <details className="replica-technical">
-          <summary>View technical sync details</summary>
-          <div className="replica-proof-row">
-            <div>
-              <span>Changes this tablet has seen</span>
-              <strong>{vectorLabel(replica.vector)}</strong>
-            </div>
-            <div>
-              <span>Record fingerprint</span>
-              <strong>{shortDigest(replica.digest)}</strong>
-            </div>
-          </div>
-        </details>
-      </div>
-
-      <details className="manual-editor">
-        <summary>Optional: edit this tablet yourself</summary>
-        <p>
-          The edit is written to this tablet first. {replica.online ? "It will then sync to the server." : "It will wait here until signal returns."}
-        </p>
-        <div className="manual-editor__selects">
-          <label>
-            <span>Priority</span>
-            <select
-              value={replica.state.priority}
-              disabled={busy}
-              onChange={(event) => onEdit("priority", event.target.value)}
-            >
-              {priorities.map((priority) => <option key={priority}>{priority}</option>)}
-            </select>
-          </label>
-          <label>
-            <span>Status</span>
-            <select
-              value={replica.state.status}
-              disabled={busy}
-              onChange={(event) => onEdit("status", event.target.value)}
-            >
-              {statuses.map((status) => <option key={status}>{status}</option>)}
-            </select>
-          </label>
         </div>
-        <form onSubmit={submitObservation}>
-          <label>
-            <span>Observation</span>
-            <textarea
-              key={replica.state.observation}
-              name="observation"
-              defaultValue={replica.state.observation ?? ""}
-              disabled={busy}
-              rows={3}
-              required
-            />
-          </label>
-          <button className="button button--compact" type="submit" disabled={busy}>
-            Save on this tablet
-          </button>
-        </form>
-      </details>
-
-      <footer className="tablet-card__footer">
-        <span>
-          {replica.lastSyncAt
-            ? `Last updated from server ${new Date(replica.lastSyncAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`
-            : "No server update yet"}
-        </span>
-        <button
-          type="button"
-          className="text-button"
-          disabled={busy || !replica.online}
-          onClick={onSync}
-        >
-          Check for updates →
-        </button>
-      </footer>
+        <footer className="tablet__footer">
+          <span>{replica.pending.length ? `${replica.pending.length} unsent ${replica.pending.length === 1 ? "change" : "changes"}` : "No unsent changes"}</span>
+          <span>{replica.pending.length ? "Stored in this browser" : replica.online ? "Server copy received" : "Ready for your note"}</span>
+        </footer>
+      </div>
+      <div className="tablet__home" aria-hidden="true" />
     </article>
   );
 }

@@ -17,6 +17,25 @@ const snapshot: DocumentSnapshot = {
 };
 
 describe("local replica", () => {
+  it("preserves values and counters for edits that the server has not acknowledged", () => {
+    const first = queueOperation(createReplica("tablet-north", snapshot), "observation", "First note.");
+    const second = queueOperation(first, "observation", "A newer unsent note.");
+    const response: SyncResponse = {
+      ...snapshot,
+      state: { ...snapshot.state, observation: "First note." },
+      version_vector: { baseline: 4, "tablet-north": 1 },
+      state_digest: "server-only-digest",
+      accepted_operation_ids: [first.pending[0].operation_id],
+      duplicate_operation_ids: [], operations: [], sync_mode: "incremental",
+    };
+    const updated = applySyncResponse(second, response);
+    expect(updated.pending).toHaveLength(1);
+    expect(updated.state.observation).toBe("A newer unsent note.");
+    expect(updated.vector["tablet-north"]).toBe(2);
+    expect(updated.digest).toBeNull();
+    expect(updated.nextCounter).toBe(3);
+  });
+
   it("creates an offline operation with the context known before its dot", () => {
     const replica = createReplica("tablet-north", snapshot);
     const edited = queueOperation(

@@ -20,14 +20,16 @@ export function loadReplicas(): Replica[] | null {
   }
 }
 
-export function saveReplicas(replicas: Replica[]): void {
+export function saveReplicas(replicas: Replica[]): boolean {
   try {
     localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({ version: STORAGE_VERSION, replicas } satisfies StoredReplicas),
     );
+    return true;
   } catch {
     // A private browser session may reject storage. Synchronization still works in memory.
+    return false;
   }
 }
 

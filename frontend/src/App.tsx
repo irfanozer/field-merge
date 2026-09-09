@@ -1,780 +1,344 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ProofPanel } from "./components/ProofPanel";
-import { TabletCard } from "./components/TabletCard";
+import { TabletCard, type TabletEdit } from "./components/TabletCard";
 import { Timeline } from "./components/Timeline";
-import {
-  getDocument,
-  getOperations,
-  normalizeDocument,
-  resetDemo,
-  streamUrl,
-  syncDocument,
-} from "./lib/api";
-import {
-  applySyncResponse,
-  createReplica,
-  queueOperation,
-  shortDigest,
-  vectorLabel,
-} from "./lib/replica";
-import { clearReplicas, loadReplicas, saveReplicas } from "./lib/storage";
-import {
-  DOCUMENT_ID,
-  type ActorId,
-  type ConnectionState,
-  type DemoPhase,
-  type DocumentSnapshot,
-  type EditableField,
-  type Replica,
-  type SyncReceipt,
-  type TimelineEntry,
-  type TimelineTone,
-} from "./types";
+import { ProofPanel } from "./components/ProofPanel";
+import { ApiError, getDocument, getOperations, normalizeDocument, resetDemo, streamUrl, syncDocument } from "./lib/api";
+import { applySyncResponse, createReplica, queueOperation } from "./lib/replica";
+import { loadReplicas, saveReplicas } from "./lib/storage";
+import { DOCUMENT_ID, type ActorId, type ConnectionState, type DocumentSnapshot, type Replica, type SyncReceipt, type TimelineEntry } from "./types";
 
-const pause = (milliseconds: number) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+type Action = "loading" | "sending" | "resolving" | "resetting" | null;
+const steps = ["Write offline", "Send saved notes", "Review together", "Same report"];
+const offlinePair = (snapshot?: DocumentSnapshot) =>
+  (["tablet-north", "tablet-south"] as ActorId[]).map((id) => ({ ...createReplica(id, snapshot), online: false }));
 
 function initialReplicas(): Replica[] {
   const stored = loadReplicas();
-  if (
-    stored?.length === 2 &&
-    stored.some((replica) => replica.actorId === "tablet-north") &&
-    stored.some((replica) => replica.actorId === "tablet-south")
-  ) {
-    return stored;
-  }
-  return [createReplica("tablet-north"), createReplica("tablet-south")];
-}
-
-function phaseCopy(phase: DemoPhase): { number: string; label: string; title: string; body: string } {
-  switch (phase) {
-    case "resetting":
-      return {
-        number: "1 / 5",
-        label: "Starting together",
-        title: "Both tablets load the same inspection report.",
-        body: "FieldMerge reads one saved report from the server and puts the same copy on both test tablets.",
-      };
-    case "offline-editing":
-      return {
-        number: "2 / 5",
-        label: "Internet disconnected",
-        title: "Each worker saves a different note while offline.",
-        body: "The notes are stored on the tablets first. The server has not received either note yet.",
-      };
-    case "reconnecting":
-      return {
-        number: "3 / 5",
-        label: "Internet restored",
-        title: "Both tablets send their saved notes to FieldMerge.",
-        body: "Tablet South reconnects first and Tablet North second. FieldMerge keeps both notes instead of letting the last connection erase one.",
-      };
-    case "conflict":
-      return {
-        number: "4 / 5",
-        label: "Your turn",
-        title: "Two valid notes need one human decision.",
-        body: "Because both notes were written offline, software cannot know which wording is correct. Review them and choose the final report below.",
-      };
-    case "resolving":
-      return {
-        number: "5 / 5",
-        label: "Saving your decision",
-        title: "The final note is being sent to both tablets.",
-        body: "FieldMerge saves your approved wording on the server, then updates both devices with the same report.",
-      };
-    case "proved":
-      return {
-        number: "Done",
-        label: "Demo complete",
-        title: "Both tablets now show the same final report.",
-        body: "No offline note was silently erased. The two tablets and the database now have the same record fingerprint.",
-      };
-    case "error":
-      return {
-        number: "!",
-        label: "Demo stopped",
-        title: "The server connection was interrupted.",
-        body: "Restore the backend connection and run the demo again. Any unsent work is still visible on its tablet.",
-      };
-    default:
-      return {
-        number: "Ready",
-        label: "Guided demo · two clicks total",
-        title: "Start the demo. It pauses when it needs your decision.",
-        body: "Your first click runs the offline and reconnect steps. After you review the two saved notes, your second click sends one final report to both tablets.",
-      };
-  }
-}
-
-const demoSteps = [
-  "Load the same report",
-  "Save two notes offline",
-  "Reconnect both tablets",
-  "You review the notes",
-  "Everyone gets the final report",
-];
-
-function phaseStep(phase: DemoPhase): number {
-  switch (phase) {
-    case "offline-editing": return 1;
-    case "reconnecting": return 2;
-    case "conflict": return 3;
-    case "resolving": return 4;
-    case "proved": return 5;
-    default: return 0;
-  }
+  return stored?.length === 2 && stored.some((r) => r.actorId === "tablet-north") && stored.some((r) => r.actorId === "tablet-south")
+    ? stored
+    : offlinePair();
 }
 
 function App() {
-  const [replicas, setReplicas] = useState<Replica[]>(initialReplicas);
+  const [replicas, setReplicas] = useState(initialReplicas);
   const replicasRef = useRef(replicas);
   const [server, setServer] = useState<DocumentSnapshot | null>(null);
-  const [phase, setPhase] = useState<DemoPhase>("ready");
+  const [action, setAction] = useState<Action>("loading");
+  const lock = useRef(false);
+  const [ready, setReady] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [streamState, setStreamState] = useState<ConnectionState>("connecting");
   const [timeline, setTimeline] = useState<TimelineEntry[]>([]);
   const [receipt, setReceipt] = useState<SyncReceipt | null>(null);
+  const [verifiedDigest, setVerifiedDigest] = useState<string | null>(null);
   const [operationCount, setOperationCount] = useState(0);
-  const [streamState, setStreamState] = useState<ConnectionState>("connecting");
-  const [backendReady, setBackendReady] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [activity, setActivity] = useState("Reading the shared report from the server…");
   const [resolutionText, setResolutionText] = useState("");
-  const conflictLoggedRef = useRef(false);
+  const [drafts, setDrafts] = useState<Record<string, boolean>>({});
+  const [editorVersion, setEditorVersion] = useState(0);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [storageWarning, setStorageWarning] = useState(false);
 
-  const replaceReplicas = useCallback((next: Replica[] | ((current: Replica[]) => Replica[])) => {
-    const value = typeof next === "function" ? next(replicasRef.current) : next;
-    replicasRef.current = value;
-    setReplicas(value);
-    saveReplicas(value);
+  const replaceReplicas = useCallback((next: Replica[]) => {
+    replicasRef.current = next;
+    setReplicas(next);
+    setStorageWarning(!saveReplicas(next));
   }, []);
 
-  const addTimeline = useCallback((
-    source: string,
-    title: string,
-    detail: string,
-    tone: TimelineTone,
-    extras?: Pick<TimelineEntry, "operationId" | "sequence">,
-  ) => {
-    const entry: TimelineEntry = {
-      id: crypto.randomUUID(),
-      at: new Date().toISOString(),
-      source,
-      title,
-      detail,
-      tone,
-      ...extras,
-    };
-    setTimeline((current) => [...current, entry]);
+  const log = useCallback((source: string, title: string, detail: string, sequence?: number) => {
+    setTimeline((items) => [...items, {
+      id: crypto.randomUUID(), at: new Date().toISOString(), source, title, detail, sequence, tone: "neutral",
+    }]);
   }, []);
 
-  const refreshOperationCount = useCallback(async () => {
+  const adoptServer = useCallback((snapshot: DocumentSnapshot) => {
+    setServer((current) => !current || snapshot.server_sequence >= current.server_sequence ? snapshot : current);
+  }, []);
+
+  const refreshCount = useCallback(async () => {
+    try { setOperationCount((await getOperations(DOCUMENT_ID)).length); }
+    catch { /* The optional history count does not control synchronization. */ }
+  }, []);
+
+  const readInitial = useCallback(async (isActive: () => boolean = () => true) => {
     try {
-      const operations = await getOperations(DOCUMENT_ID);
-      setOperationCount(operations.length);
-    } catch {
-      // The primary sync result remains usable if the optional audit count cannot refresh.
+      const snapshot = await getDocument(DOCUMENT_ID);
+      if (!isActive()) return;
+      adoptServer(snapshot);
+      if (!replicasRef.current.some((r) => r.pending.length)) {
+        replaceReplicas(offlinePair(snapshot));
+        setEditorVersion((value) => value + 1);
+      }
+      setReady(true);
+      setError(null);
+      setActivity("Tablets are offline. Saving stays in this browser until you reconnect.");
+      void refreshCount();
+    } catch (cause) {
+      if (!isActive()) return;
+      setError(cause instanceof Error ? cause.message : "Could not read the report.");
+      setActivity("The server could not be reached. Saved changes stay on their tablets.");
+    } finally {
+      if (isActive()) setAction(null);
     }
-  }, []);
-
-  const performSync = useCallback(async (replica: Replica) => {
-    if (!replica.online) throw new Error(`${replica.label} has no signal.`);
-    const response = await syncDocument(DOCUMENT_ID, {
-      client_id: replica.actorId,
-      known_vector: replica.vector,
-      pending_operations: replica.pending,
-    });
-    const updated = applySyncResponse(replica, response);
-    replaceReplicas((current) =>
-      current.map((candidate) => candidate.actorId === replica.actorId ? updated : candidate),
-    );
-    setServer(response);
-    setBackendReady(true);
-    setError(null);
-    const nextReceipt: SyncReceipt = {
-      actorId: replica.actorId,
-      accepted: response.accepted_operation_ids,
-      duplicates: response.duplicate_operation_ids,
-      returnedOperations: response.operations.length,
-      syncMode: response.sync_mode,
-      sequence: response.server_sequence,
-      digest: response.state_digest,
-      at: new Date().toISOString(),
-    };
-    setReceipt((current) =>
-      response.accepted_operation_ids.length > 0 ||
-      response.duplicate_operation_ids.length > 0 ||
-      current === null
-        ? nextReceipt
-        : current,
-    );
-    addTimeline(
-      replica.label,
-      response.accepted_operation_ids.length
-        ? `${response.accepted_operation_ids.length} saved change reached the server`
-        : "This tablet downloaded the latest report",
-      response.operations.length
-        ? `${response.operations.length} change${response.operations.length === 1 ? "" : "s"} from another device ${response.operations.length === 1 ? "was" : "were"} returned.`
-        : "The server confirmed that this tablet is up to date.",
-      replica.actorId === "tablet-north" ? "north" : "south",
-      { sequence: response.server_sequence },
-    );
-    if (response.conflicts.length > 0 && !conflictLoggedRef.current) {
-      conflictLoggedRef.current = true;
-      addTimeline(
-        "FieldMerge",
-        "Both offline notes were kept for review",
-        "Neither worker could see the other note while offline, so FieldMerge saved both instead of silently choosing one.",
-        "conflict",
-        { sequence: response.server_sequence },
-      );
-    }
-    void refreshOperationCount();
-    return { replica: updated, response };
-  }, [addTimeline, refreshOperationCount, replaceReplicas]);
+  }, [adoptServer, refreshCount, replaceReplicas]);
 
   useEffect(() => {
     let active = true;
-    async function loadServer() {
-      try {
-        const hasPendingWork = replicasRef.current.some((replica) => replica.pending.length > 0);
-        const document = hasPendingWork
-          ? await getDocument(DOCUMENT_ID)
-          : await resetDemo();
-        if (!active) return;
-        setServer(document);
-        setBackendReady(true);
-        setError(null);
-        if (!hasPendingWork) {
-          replaceReplicas(
-            replicasRef.current.map((replica) => createReplica(replica.actorId, document)),
-          );
-        }
-        void refreshOperationCount();
-      } catch (cause) {
-        if (!active) return;
-        setBackendReady(false);
-        setError(cause instanceof Error ? cause.message : "Backend is unavailable.");
-      }
-    }
-    void loadServer();
+    void readInitial(() => active);
     return () => { active = false; };
-  }, [refreshOperationCount, replaceReplicas]);
+  }, [readInitial]);
 
   useEffect(() => {
     let disposed = false;
     let socket: WebSocket | null = null;
-    let reconnectTimer: number | null = null;
-
+    let timer: number | undefined;
     function connect() {
       if (disposed) return;
       setStreamState("connecting");
       socket = new WebSocket(streamUrl(DOCUMENT_ID));
-      socket.onopen = () => setStreamState("live");
+      socket.onopen = () => { if (!disposed) setStreamState("live"); };
       socket.onmessage = (event) => {
+        if (disposed) return;
         try {
           const raw = JSON.parse(String(event.data)) as Record<string, unknown>;
-          const candidate = raw.document ?? raw.snapshot ?? raw;
-          if (candidate && typeof candidate === "object" && "state" in candidate) {
-            setServer(normalizeDocument(candidate));
-            setBackendReady(true);
-          }
-        } catch {
-          // Unknown notification types do not replace the last verified snapshot.
-        }
+          const value = raw.document ?? raw.snapshot ?? raw;
+          if (value && typeof value === "object" && "state" in value) adoptServer(normalizeDocument(value));
+        } catch { /* Ignore notifications that are not document snapshots. */ }
       };
-      socket.onerror = () => setStreamState("offline");
+      socket.onerror = () => { if (!disposed) setStreamState("offline"); };
       socket.onclose = () => {
-        setStreamState("offline");
-        if (!disposed) reconnectTimer = window.setTimeout(connect, 1800);
+        if (!disposed) { setStreamState("offline"); timer = window.setTimeout(connect, 1800); }
       };
     }
-
     connect();
-    return () => {
-      disposed = true;
-      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-      socket?.close();
-    };
-  }, []);
+    return () => { disposed = true; window.clearTimeout(timer); socket?.close(); };
+  }, [adoptServer]);
 
-  useEffect(() => {
-    if (phase !== "conflict") return;
-    const timer = window.setTimeout(() => {
-      document.getElementById("resolution-panel")?.scrollIntoView?.({ behavior: "smooth", block: "start" });
-    }, 150);
-    return () => window.clearTimeout(timer);
-  }, [phase]);
-
-  async function startGuidedProof() {
-    if (busy) return;
-    setBusy(true);
-    setError(null);
-    setTimeline([]);
-    setReceipt(null);
-    setResolutionText("");
-    setPhase("resetting");
-    conflictLoggedRef.current = false;
-    clearReplicas();
-
-    try {
-      const baseline = await resetDemo();
-      setServer(baseline);
-      await refreshOperationCount();
-      let north = { ...createReplica("tablet-north", baseline), online: false };
-      let south = { ...createReplica("tablet-south", baseline), online: false };
-      replaceReplicas([north, south]);
-      addTimeline(
-        "FieldMerge server",
-        "Both tablets loaded the same inspection report",
-        "Tablet North and Tablet South received the same starting report from the database.",
-        "server",
-        { sequence: baseline.server_sequence },
-      );
-
-      await pause(900);
-      setPhase("offline-editing");
-      north = queueOperation(
-        north,
-        "observation",
-        "Seal leak increased to a steady drip during load test.",
-      );
-      south = queueOperation(
-        south,
-        "observation",
-        "Motor housing vibration is above the normal field range.",
-      );
-      replaceReplicas([north, south]);
-      addTimeline(
-        north.label,
-        "North saved a note without internet",
-        "The note is stored in this browser as one unsent change. The server has not received it yet.",
-        "north",
-        { operationId: north.pending.at(-1)?.operation_id },
-      );
-      addTimeline(
-        south.label,
-        "South saved a different note without internet",
-        "This note is also waiting on its own tablet. Neither worker could see the other worker’s note.",
-        "south",
-        { operationId: south.pending.at(-1)?.operation_id },
-      );
-
-      await pause(1_000);
-      setPhase("reconnecting");
-      south = { ...south, online: true };
-      replaceReplicas([north, south]);
-      addTimeline(
-        south.label,
-        "South reconnected first",
-        "Its saved note is now sent through the real API and stored on the server.",
-        "south",
-      );
-      south = (await performSync(south)).replica;
-
-      await pause(1_000);
-      north = { ...north, online: true };
-      replaceReplicas([north, south]);
-      addTimeline(
-        north.label,
-        "North reconnected second",
-        "Its independently written note is sent next. Reconnecting last is not allowed to erase South’s note.",
-        "north",
-      );
-      const northSync = await performSync(north);
-      north = northSync.replica;
-
-      south = replicasRef.current.find((replica) => replica.actorId === "tablet-south") ?? south;
-      south = (await performSync(south)).replica;
-      const conflict = northSync.response.conflicts.find((item) => item.field === "observation");
-      const values = conflict?.candidates.map((candidate) => candidate.value) ?? [
-        "Seal leak increased; motor vibration is above normal.",
-      ];
-      setResolutionText(values.join(" "));
-      setPhase("conflict");
-    } catch (cause) {
-      setPhase("error");
-      setBackendReady(false);
-      setError(cause instanceof Error ? cause.message : "The guided proof could not complete.");
-    } finally {
-      setBusy(false);
-    }
+  async function performSync(actorId: ActorId) {
+    const replica = replicasRef.current.find((r) => r.actorId === actorId)!;
+    setActivity(`${replica.label} → sync API → database. Waiting for the server's response…`);
+    const response = await syncDocument(DOCUMENT_ID, {
+      client_id: actorId, known_vector: replica.vector, pending_operations: replica.pending,
+    });
+    const latest = replicasRef.current.find((r) => r.actorId === actorId)!;
+    const updated = applySyncResponse({ ...latest, online: true }, response);
+    replaceReplicas(replicasRef.current.map((r) => r.actorId === actorId ? updated : r));
+    adoptServer(response);
+    setReady(true);
+    setReceipt({
+      actorId, accepted: response.accepted_operation_ids, duplicates: response.duplicate_operation_ids,
+      returnedOperations: response.operations.length, syncMode: response.sync_mode,
+      sequence: response.server_sequence, digest: response.state_digest, at: new Date().toISOString(),
+    });
+    log(replica.label, response.accepted_operation_ids.length ? "Server saved the changes" : "Latest report received",
+      `POST /api/v1/documents/${DOCUMENT_ID}/sync · ${response.accepted_operation_ids.length} accepted · ${response.duplicate_operation_ids.length} already stored`, response.server_sequence);
+    return response;
   }
 
-  async function resolveConflict() {
-    const value = resolutionText.trim();
-    if (!value || busy) return;
-    setBusy(true);
+  function saveTablet(actorId: ActorId, edits: TabletEdit[]) {
+    if (lock.current || action) return;
+    let replica = replicasRef.current.find((r) => r.actorId === actorId)!;
+    for (const edit of edits) replica = queueOperation({ ...replica, online: false }, edit.field, edit.value);
+    replaceReplicas(replicasRef.current.map((r) => r.actorId === actorId ? replica : r));
+    setVerifiedDigest(null);
     setError(null);
-    setPhase("resolving");
-    try {
-      let north = replicasRef.current.find((replica) => replica.actorId === "tablet-north");
-      if (!north) throw new Error("Tablet North replica is missing.");
-      north = { ...north, online: true };
-      north = queueOperation(north, "observation", value, "resolve");
-      replaceReplicas((current) =>
-        current.map((replica) => replica.actorId === north?.actorId ? north : replica),
-      );
-      addTimeline(
-        "You",
-        "Final report wording approved",
-        "FieldMerge asks for a person only because both offline notes could be valid. Your choice is now being saved.",
-        "conflict",
-        { operationId: north.pending.at(-1)?.operation_id },
-      );
-      north = (await performSync(north)).replica;
-      let south = replicasRef.current.find((replica) => replica.actorId === "tablet-south");
-      if (!south) throw new Error("Tablet South replica is missing.");
-      south = { ...south, online: true };
-      replaceReplicas((current) =>
-        current.map((replica) => replica.actorId === south?.actorId ? south : replica),
-      );
-      south = (await performSync(south)).replica;
+    setActivity(`${replica.label} saved locally. No request was sent to the server.`);
+    log(replica.label, "Saved on the tablet", `${edits.length} local change(s) queued. No network request.`);
+  }
+
+  async function runAction(kind: Action, work: () => Promise<void>) {
+    if (lock.current) return;
+    lock.current = true;
+    setAction(kind);
+    setError(null);
+    try { await work(); }
+    catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The request failed.");
+      setActivity("The request did not finish. Check the message above before retrying.");
+    } finally { lock.current = false; setAction(null); }
+  }
+
+  async function syncBoth() {
+    await runAction("sending", async () => {
+      // Send both original offline queues before downloading the final shared result.
+      await performSync("tablet-north");
+      await performSync("tablet-south");
+      await performSync("tablet-north");
       const latest = await getDocument(DOCUMENT_ID);
-      setServer(latest);
-      const converged = north.digest === latest.state_digest && south.digest === latest.state_digest;
-      if (!converged || latest.conflicts.length > 0) {
-        throw new Error("The server has not yet confirmed convergence.");
+      adoptServer(latest);
+      if (!latest.conflicts.length && replicasRef.current.every((r) => !r.pending.length && r.digest === latest.state_digest)) {
+        setVerifiedDigest(latest.state_digest);
       }
-      addTimeline(
-        "FieldMerge server",
-        "Both tablets received the approved report",
-        "Tablet North, Tablet South, and the database now have the same saved content.",
-        "success",
-        { sequence: latest.server_sequence },
-      );
-      setPhase("proved");
-    } catch (cause) {
-      setPhase("error");
-      setError(cause instanceof Error ? cause.message : "Conflict resolution failed.");
-    } finally {
-      setBusy(false);
-    }
+      setActivity(latest.conflicts.length
+        ? "Both notes reached the database. Choose the wording everyone should receive."
+        : "Both tablets downloaded the server's report.");
+      void refreshCount();
+    });
   }
 
-  async function handleToggleConnection(actorId: ActorId, online: boolean) {
-    const current = replicasRef.current.find((replica) => replica.actorId === actorId);
-    if (!current || busy) return;
-    const updated = { ...current, online };
-    replaceReplicas((all) => all.map((replica) => replica.actorId === actorId ? updated : replica));
-    addTimeline(
-      current.label,
-      online ? "Network connection restored" : "Device moved out of signal range",
-      online
-        ? `${current.pending.length} queued local change${current.pending.length === 1 ? " is" : "s are"} ready to synchronize.`
-        : "New edits will stay in this browser replica until the connection returns.",
-      actorId === "tablet-north" ? "north" : "south",
-    );
-    if (online) {
-      setBusy(true);
+  const conflict = server?.conflicts.find((item) => item.field === "observation");
+  const hasPending = replicas.some((r) => r.pending.length > 0);
+  const savedNotes = replicas.filter((r) => r.pending.some((op) => op.field === "observation")).length;
+  const hasDrafts = Object.values(drafts).some(Boolean);
+  const complete = Boolean(verifiedDigest && verifiedDigest === server?.state_digest && !conflict && !hasPending &&
+    replicas.every((r) => r.digest === server.state_digest));
+  const review = Boolean(conflict && (!hasPending || action === "resolving"));
+  const progress = complete ? 4 : review || action === "resolving" ? 2 : action === "sending" || savedNotes === 2 ? 1 : 0;
+  const busy = action !== null;
+
+  async function approveNote() {
+    if (!resolutionText.trim() || resolutionText.trim().length > 4000 || !conflict || hasDrafts) return;
+    const candidateIds = conflict.candidates.map((c) => c.operation_id).sort().join(",");
+    await runAction("resolving", async () => {
+      const refreshed = await performSync("tablet-north");
+      const currentIds = refreshed.conflicts.find((item) => item.field === "observation")?.candidates.map((c) => c.operation_id).sort().join(",");
+      if (candidateIds !== currentIds) throw new Error("The shared notes changed. Review the latest notes before saving.");
+      const north = replicasRef.current.find((r) => r.actorId === "tablet-north")!;
+      const updated = queueOperation(north, "observation", resolutionText.trim(), "resolve");
+      replaceReplicas(replicasRef.current.map((r) => r.actorId === updated.actorId ? updated : r));
       try {
-        await performSync(updated);
+        await performSync("tablet-north");
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "Sync failed.");
-      } finally {
-        setBusy(false);
+        if (cause instanceof ApiError && cause.status === 422) {
+          // A validation rejection guarantees this resolution was not stored.
+          // Restore only that operation's pre-submit replica; keep the wording editable.
+          replaceReplicas(replicasRef.current.map((r) => r.actorId === north.actorId ? north : r));
+          await performSync("tablet-north");
+          throw new Error("The shared notes changed before your decision could be saved. Your wording is kept below. Review the latest notes and try again.");
+        }
+        throw cause;
       }
-    }
-  }
-
-  async function handleManualEdit(actorId: ActorId, field: EditableField, value: string) {
-    const current = replicasRef.current.find((replica) => replica.actorId === actorId);
-    if (!current || busy) return;
-    const updated = queueOperation(current, field, value);
-    replaceReplicas((all) => all.map((replica) => replica.actorId === actorId ? updated : replica));
-    const operation = updated.pending.at(-1);
-    addTimeline(
-      current.label,
-      `${field.replace("_", " ")} edited locally`,
-      current.online
-        ? "The local operation is now being sent through the sync API."
-        : "The operation is safely queued on this offline tablet.",
-      actorId === "tablet-north" ? "north" : "south",
-      { operationId: operation?.operation_id },
-    );
-    if (current.online) {
-      setBusy(true);
-      try {
-        await performSync(updated);
-      } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "Sync failed.");
-      } finally {
-        setBusy(false);
+      await performSync("tablet-south");
+      const verified = await getDocument(DOCUMENT_ID);
+      adoptServer(verified);
+      if (verified.conflicts.length || replicasRef.current.some((r) => r.pending.length || r.digest !== verified.state_digest)) {
+        throw new Error("The copies do not match yet. Send again to fetch the latest report.");
       }
-    }
+      setVerifiedDigest(verified.state_digest);
+      setActivity("Confirmed by the server: both tablets have the same final report.");
+      log("Server", "All three copies match", "Both tablet fingerprints match the document read back from the API.", verified.server_sequence);
+      void refreshCount();
+    });
   }
 
-  async function handleManualSync(actorId: ActorId) {
-    const replica = replicasRef.current.find((candidate) => candidate.actorId === actorId);
-    if (!replica || busy) return;
-    setBusy(true);
-    try {
-      await performSync(replica);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Sync failed.");
-    } finally {
-      setBusy(false);
-    }
+  async function startAnotherPair() {
+    await runAction("loading", async () => {
+      const latest = await getDocument(DOCUMENT_ID);
+      adoptServer(latest);
+      replaceReplicas(offlinePair(latest));
+      setReceipt(null);
+      setVerifiedDigest(null);
+      setResolutionText("");
+      setDrafts({});
+      setEditorVersion((value) => value + 1);
+      setActivity("A fresh pair of offline editors is ready. Previous notes remain in the server history.");
+    });
   }
 
-  const copy = phaseCopy(phase);
-  const serverConflict = server?.conflicts.find((conflict) => conflict.field === "observation");
-  const serverObservation = serverConflict
-    ? `${serverConflict.candidates.length} offline notes saved — waiting for your decision`
-    : (server?.state.observation ?? "Waiting for backend");
-  const activeActor = phase === "offline-editing" ? "tablet-south" : phase === "reconnecting" ? "tablet-north" : undefined;
+  async function restartDemo() {
+    await runAction("resetting", async () => {
+      const snapshot = await resetDemo();
+      setServer(snapshot);
+      replaceReplicas(offlinePair(snapshot));
+      setReceipt(null);
+      setVerifiedDigest(null);
+      setResolutionText("");
+      setDrafts({});
+      setTimeline([]);
+      setEditorVersion((value) => value + 1);
+      setConfirmReset(false);
+      setActivity("Demo reset. Write a note on each offline tablet.");
+      void refreshCount();
+    });
+  }
 
   return (
     <div className="app-shell">
       <header className="site-header">
-        <a className="brand" href="#top" aria-label="FieldMerge home">
-          <span>FM</span>
-          <div>
-            <strong>FieldMerge</strong>
-            <small>Offline inspection sync</small>
-          </div>
-        </a>
-        <div className={`backend-status ${backendReady ? "is-ready" : "is-unavailable"}`} role="status">
-          <i aria-hidden="true" />
-          {backendReady ? "Server connected" : "Server unavailable"}
-          {server && <span>update #{server.server_sequence}</span>}
-        </div>
+        <a className="brand" href="#top"><span>FM</span><strong>FieldMerge</strong></a>
+        <span className={`backend-status ${ready && !error ? "is-ready" : ""}`}><i aria-hidden="true" />{error ? "Check last request" : ready ? "Server connected" : busy ? "Connecting…" : "Server unavailable"}</span>
       </header>
-
       <main id="top">
-        <section className="hero">
-          <div className="hero__copy">
-            <p className="eyebrow">Software that protects work during internet loss</p>
-            <h1>Two workers edit the same report offline.</h1>
-            <p className="hero__lede">
-              FieldMerge saves each worker&apos;s changes on their device. When internet returns, it sends every change to the server, keeps disagreements for review, and updates everyone with the same approved report.
-            </p>
-            <p className="hero__risk"><strong>The problem it prevents:</strong> a normal “last save wins” system can silently erase the other worker&apos;s note.</p>
-            <div className="hero__facts" aria-label="Project facts">
-              <span><i /> Works while a device is offline</span>
-              <span><i /> Stores every change in PostgreSQL</span>
-              <span><i /> Updates both devices live</span>
-            </div>
-          </div>
-          <div className="hero__promise">
-            <p className="eyebrow">The guided demo starts here</p>
-            <strong>Watch FieldMerge keep one offline note from erasing another.</strong>
-            <p>You click once. The page creates two offline edits, reconnects both test tablets, and pauses when it needs your decision.</p>
-            <a className="hero-cta" href="#live-proof">
-              <span>Go to the guided demo</span>
-              <small>One click · no setup · then one decision</small>
-              <b aria-hidden="true">↓</b>
-            </a>
-          </div>
+        <section className="intro">
+          <p className="eyebrow">Try an offline inspection</p>
+          <h1>No internet. Two notes. Neither lost.</h1>
+          <p>Two workers inspect the same pump without a connection. Write a note on each tablet, then reconnect them. FieldMerge keeps both notes and asks you what the shared report should say.</p>
+          <small>These are two simulated tablets in your browser, connected to a real API and database.</small>
         </section>
 
-        <section className="request-path" aria-labelledby="path-title">
-          <div className="request-path__intro">
-            <p className="eyebrow">What FieldMerge does</p>
-            <h2 id="path-title">Save offline. Sync later. Lose nothing.</h2>
-          </div>
-          <ol>
-            <li><span>01</span><strong>Worker taps Save</strong><small>The device keeps the change without internet</small></li>
-            <li><span>02</span><strong>Internet returns</strong><small>The device sends its unsent changes</small></li>
-            <li><span>03</span><strong>Server stores each change</strong><small>Repeated requests cannot create duplicates</small></li>
-            <li><span>04</span><strong>FieldMerge checks edits</strong><small>Independent notes are kept for human review</small></li>
-            <li><span>05</span><strong>Everyone receives the result</strong><small>Both devices get the approved report</small></li>
+        <section id="live-proof" className="demo" aria-label="Hands-on offline demo">
+          <ol className="demo-progress" aria-label="Demo progress">
+            {steps.map((label, index) => <li key={label} className={progress > index ? "is-complete" : progress === index ? "is-active" : ""} aria-current={progress === index ? "step" : undefined}>
+              <span>{progress > index ? "✓" : index + 1}</span>{label}
+            </li>)}
           </ol>
-        </section>
-
-        <section className="live-proof" id="live-proof" aria-labelledby="demo-title">
-          <div className="demo-control">
-            <div className="demo-control__phase" aria-live="polite">
-              <span>{copy.number}</span>
-              <div>
-                <p className="eyebrow">{copy.label}</p>
-                <h2 id="demo-title">{copy.title}</h2>
-                <p>{copy.body}</p>
-              </div>
-            </div>
-            <div className="demo-control__actions">
-              {phase === "conflict" ? (
-                <>
-                  <span className="action-hint">Your decision is the only manual step.</span>
-                  <a className="button button--primary" href="#resolution-panel">
-                    Review both notes
-                    <span aria-hidden="true">↓</span>
-                  </a>
-                </>
-              ) : (
-                <>
-                  <button
-                    className="button button--primary"
-                    type="button"
-                    disabled={busy || !backendReady}
-                    onClick={() => void startGuidedProof()}
-                  >
-                    {busy ? "Demo running…" : phase === "proved" || phase === "error" ? "Run the demo again" : "Start the guided demo"}
-                    <span aria-hidden="true">→</span>
-                  </button>
-                  <span className="action-hint">Steps 1–3 run automatically. The demo pauses at step 4 for you.</span>
-                </>
-              )}
-              {!backendReady && <small>The demo needs the local server before it can start.</small>}
-            </div>
-          </div>
-
-          <ol className="demo-progress" aria-label="Guided demo steps">
-            {demoSteps.map((step, index) => {
-              const currentStep = phaseStep(phase);
-              const completed = currentStep > index;
-              const active = phase !== "proved" && currentStep === index;
-              return (
-                <li className={`${completed ? "is-complete" : ""}${active ? " is-active" : ""}`} key={step}>
-                  <span>{completed ? "✓" : index + 1}</span>
-                  <strong>{step}</strong>
-                </li>
-              );
-            })}
-          </ol>
-
-          <div className="demo-reality">
+          <div className="next-step">
             <div>
-              <span>Shown as a test scenario</span>
-              <strong>Two field tablets losing and regaining signal</strong>
-              <p>Both tablet screens are represented side by side in this browser so you can follow them together.</p>
+              <p className="eyebrow">{complete ? "Done" : review ? "Your decision" : "Your next step"}</p>
+              <h2>{complete ? "Both tablets have the same report." : review ? "Choose one note or combine them below." : savedNotes === 2 ? "Both notes are saved. Bring the tablets online." : "Write and save a different note on each tablet."}</h2>
+              <p>{hasDrafts ? "Save your changes on the tablet before sending." : complete ? "The result was read back from the server and checked against both tablets." : review ? "Neither worker had seen the other's note. The server kept both." : `${savedNotes} of 2 tablets have an unsent note. Saving does not send anything yet.`}</p>
             </div>
-            <div>
-              <span>Actually happening</span>
-              <strong>Offline queues, API requests, database writes, and live updates</strong>
-              <p>Reconnection uses the real FastAPI service and PostgreSQL database running with this project.</p>
-            </div>
+            {complete ? <button className="button button--primary" disabled={busy} onClick={() => void startAnotherPair()}>Write another pair</button>
+              : !review && <button className="button button--primary" disabled={busy || !ready || hasDrafts || (savedNotes < 2 && !receipt && !(error && hasPending))} onClick={() => void syncBoth()}>
+                {action === "sending" ? "Sending saved changes…" : error && (hasPending || receipt) ? "Retry sending saved changes" : "Reconnect & send notes"}
+              </button>}
           </div>
 
-          {error && (
-            <div className="error-banner" role="alert">
-              <strong>The demo stopped because the server did not respond.</strong>
-              <span>{error}</span>
-            </div>
-          )}
+          {error && <div className="error-banner" role="alert"><strong>Something needs attention.</strong> {error}
+            {!ready && <button className="text-button" disabled={busy} onClick={() => { setAction("loading"); void readInitial(); }}>Retry connection</button>}
+          </div>}
+          {storageWarning && <p className="error-banner" role="alert">Browser storage is unavailable. Edits are held in memory only. Keep this page open until they are sent.</p>}
 
-          {phase === "conflict" && serverConflict && (
-            <section className="resolution-panel" id="resolution-panel" aria-labelledby="resolution-title">
-              <div className="resolution-panel__intro">
-                <p className="eyebrow">Step 4 of 5 · Your input is needed</p>
-                <h2 id="resolution-title">Keep one note or combine both.</h2>
-                <p>
-                  The workers edited the same report while neither could see the other&apos;s work. FieldMerge saved both notes. You decide what the shared report should say.
-                </p>
-              </div>
-              <div className="resolution-candidates">
-                {serverConflict.candidates.map((candidate, index) => (
-                  <button
-                    type="button"
-                    key={candidate.operation_id}
-                    onClick={() => setResolutionText(candidate.value)}
-                  >
-                    <span>{String(index + 1).padStart(2, "0")} · {candidate.actor_id.replace("tablet-", "Tablet ")}</span>
-                    <strong>{candidate.value}</strong>
-                    <small>Use only this note</small>
-                  </button>
-                ))}
-              </div>
-              <label className="resolution-input">
-                <span>Final report wording</span>
-                <textarea
-                  rows={3}
-                  value={resolutionText}
-                  onChange={(event) => setResolutionText(event.target.value)}
-                />
-              </label>
-              <button
-                className="button button--resolve"
-                type="button"
-                disabled={busy || !resolutionText.trim()}
-                onClick={() => void resolveConflict()}
-              >
-                {busy ? "Updating both tablets…" : "Save final report and update both tablets"}
-                <span aria-hidden="true">→</span>
-              </button>
-              <details className="resolution-technical">
-                <summary>View technical detail</summary>
-                <p>The server records one resolution operation that references both saved notes. The original notes remain in the operation history.</p>
-              </details>
-            </section>
-          )}
-
-          <div className="replica-grid">
-            {replicas.map((replica) => (
-              <TabletCard
-                key={replica.actorId}
-                replica={replica}
-                conflicts={server?.conflicts ?? []}
-                active={activeActor === replica.actorId}
-                busy={busy || phase === "conflict" || phase === "resolving"}
-                onToggleConnection={(online) => void handleToggleConnection(replica.actorId, online)}
-                onSync={() => void handleManualSync(replica.actorId)}
-                onEdit={(field, value) => void handleManualEdit(replica.actorId, field, value)}
-              />
-            ))}
+          <div className="tablet-grid">
+            {replicas.map((replica) => <TabletCard key={`${replica.actorId}-${editorVersion}`} replica={replica}
+              busy={busy} ready={ready || replica.pending.length > 0} complete={complete}
+              onSave={(edits) => saveTablet(replica.actorId, edits)}
+              onDraftChange={(dirty) => setDrafts((current) => ({ ...current, [replica.actorId]: dirty }))} />)}
           </div>
 
-          <section className={`server-copy ${serverConflict ? "server-copy--conflict" : ""}`} aria-label="Shared report on the server">
-            <div className="server-copy__identity">
-              <p className="eyebrow">Shared report on the server</p>
-              <h3>Inspection PUMP-07</h3>
-              <span>Stored in PostgreSQL</span>
-            </div>
-            <div className="server-copy__observation">
-              <span>Server&apos;s current note</span>
-              <strong>{serverObservation}</strong>
-            </div>
-            <div className="server-copy__meta">
-              <span>Changes received</span>
-              <strong>{server ? vectorLabel(server.version_vector) : "Waiting"}</strong>
-              <span>Record fingerprint</span>
-              <code>{shortDigest(server?.state_digest ?? null)}</code>
-            </div>
+          <section className="request-path" aria-labelledby="path-title">
+            <div className="request-path__heading"><h2 id="path-title">Where your changes go</h2><span>{hasPending ? "Waiting on the tablets" : action === "sending" || action === "resolving" ? "Syncing" : receipt ? "Server response received" : "Nothing sent yet"}</span></div>
+            <ol><li><strong>1. Tablet</strong><small>Saves in this browser</small></li><li><strong>2. Sync API</strong><small>Receives your changes</small></li><li><strong>3. Database</strong><small>Keeps the saved notes</small></li><li><strong>4. Both tablets</strong><small>Download the shared report</small></li></ol>
+            <p className="request-activity" role="status">{activity}</p>
           </section>
 
-          <div className="evidence-grid">
-            <Timeline entries={timeline} />
-            <ProofPanel
-              server={server}
-              replicas={replicas}
-              streamState={streamState}
-              operationCount={operationCount}
-              receipt={receipt}
-              proved={phase === "proved"}
-            />
-          </div>
-        </section>
+          {review && conflict && <section className="resolution-panel" id="resolution-panel" aria-labelledby="resolution-title">
+            <p className="eyebrow">Both notes were saved</p><h2 id="resolution-title">What should the shared note say?</h2>
+            <div className="resolution-candidates">
+              {conflict.candidates.map((candidate) => <button type="button" key={candidate.operation_id} disabled={busy} onClick={() => setResolutionText(candidate.value)}>
+                <span>{candidate.actor_id.replace("tablet-", "Tablet ")}</span><strong>{candidate.value}</strong><small>Use this note</small>
+              </button>)}
+            </div>
+            <button className="text-button" disabled={busy} onClick={() => setResolutionText(conflict.candidates.map((candidate) => candidate.value).join(" "))}>Combine both notes</button>
+            <label className="resolution-input">Final shared note<textarea rows={3} maxLength={4000} value={resolutionText} disabled={busy} onChange={(event) => setResolutionText(event.target.value)} placeholder="Choose a note above, combine them, or write your own wording." /></label>
+            {resolutionText.trim().length > 4000 && <p role="alert">The combined note is too long. Shorten it to 4,000 characters before saving.</p>}
+            {hasDrafts && <p>Save the unsaved draft on its tablet before approving the shared note.</p>}
+            <button className="button button--primary" disabled={busy || hasDrafts || !resolutionText.trim() || resolutionText.trim().length > 4000} onClick={() => void approveNote()}>{action === "resolving" ? "Saving your decision…" : "Save & update both tablets"}</button>
+          </section>}
 
-        <section className="explanation" aria-labelledby="explanation-title">
-          <div>
-            <p className="eyebrow">Why an edit is not lost</p>
-            <h2 id="explanation-title">How FieldMerge handles offline work safely.</h2>
-          </div>
-          <div className="explanation__cards">
-            <article>
-              <span>01</span>
-              <h3>Give every change a unique ID</h3>
-              <p>If a tablet sends the same saved change twice, the server recognizes it and stores it only once.</p>
-            </article>
-            <article>
-              <span>02</span>
-              <h3>Remember what each worker had seen</h3>
-              <p>This reveals whether an edit replaced an older value or was written independently while another device was offline.</p>
-            </article>
-            <article>
-              <span>03</span>
-              <h3>Ask a person only when needed</h3>
-              <p>Routine fields merge automatically. Two independent inspection notes stay visible until a person approves the final wording.</p>
-            </article>
-          </div>
+          <details className="technical-details">
+            <summary>
+              <span className="technical-details__intro">
+                <strong>See how the backend works</strong>
+                <span>Requests, server report &amp; history</span>
+              </span>
+              <span className="technical-details__toggle" aria-hidden="true">
+                <span className="technical-details__show">Show details <b>+</b></span>
+                <span className="technical-details__hide">Hide details <b>−</b></span>
+              </span>
+            </summary>
+            <p>The tablet connection is simulated, so this page stays online. Saved changes only leave a tablet when you press Reconnect. API requests and database writes are real. Live server notifications do not automatically overwrite an offline tablet.</p>
+            <code>POST /api/v1/documents/{DOCUMENT_ID}/sync</code>
+            <ProofPanel server={server} replicas={replicas} streamState={streamState} operationCount={operationCount} receipt={receipt} proved={complete} />
+            <Timeline entries={timeline} />
+            <div className="reset-controls">
+              {confirmReset ? <><p>This clears the shared demo's server history and your local saved edits and drafts. Other visitors use the same test report.</p><button className="button button--danger" disabled={busy} onClick={() => void restartDemo()}>Confirm reset</button><button className="text-button" onClick={() => setConfirmReset(false)}>Cancel</button></>
+                : <button className="text-button" disabled={busy} onClick={() => setConfirmReset(true)}>Reset shared demo</button>}
+            </div>
+          </details>
         </section>
       </main>
-
-      <footer className="site-footer">
-        <div>
-          <strong>FieldMerge</strong>
-          <span>Keep working offline. Reconnect without losing an edit.</span>
-        </div>
-        <p>Test inspection only · real local API and database · no production field data</p>
-      </footer>
+      <footer className="site-footer">Fictional inspection · shared demo · please do not enter personal information</footer>
     </div>
   );
 }

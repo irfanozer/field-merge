@@ -74,6 +74,7 @@ export interface Replica {
   digest: string | null;
   lastSyncAt: string | null;
   lastSyncMode: "incremental" | "snapshot" | null;
+  conflicts?: FieldConflict[];
 }
 
 export type TimelineTone = "neutral" | "north" | "south" | "server" | "conflict" | "success";

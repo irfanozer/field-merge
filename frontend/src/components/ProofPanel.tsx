@@ -31,7 +31,7 @@ export function ProofPanel({
     ? "Verified: both tablets match the server."
     : reviewNeeded
       ? "Both offline notes are stored."
-      : "Waiting for the guided demo.";
+      : "Shared report on the server";
 
   return (
     <aside className={`proof-panel ${proved ? "proof-panel--proved" : ""}`} aria-labelledby="proof-title">
@@ -49,6 +49,7 @@ export function ProofPanel({
       <p className="proof-intro">
         These values come from the API and PostgreSQL. The browser is displaying the server&apos;s saved result.
       </p>
+      <p className="proof-intro"><strong>Server&apos;s saved note: </strong>{server?.state.observation ?? (reviewNeeded ? "Competing notes are waiting for review." : "Waiting for the server.")}</p>
 
       <dl className="proof-metrics">
         <div>
@@ -57,11 +58,11 @@ export function ProofPanel({
         </div>
         <div>
           <dt>Latest server update</dt>
-          <dd>{server?.server_sequence ?? "—"}</dd>
+          <dd>{server?.server_sequence ?? "Waiting"}</dd>
         </div>
         <div>
           <dt>Notes waiting for review</dt>
-          <dd>{server?.conflicts.length ?? "—"}</dd>
+          <dd>{server?.conflicts.length ?? "Waiting"}</dd>
         </div>
         <div>
           <dt>Last sync result</dt>
@@ -94,7 +95,7 @@ export function ProofPanel({
       <div className={`digest-verdict ${resultVerified ? "is-matched" : ""}`}>
         <span aria-hidden="true">{resultVerified ? "✓" : reviewNeeded ? "2" : "…"}</span>
         <div>
-          <strong>{resultVerified ? "Both tablets match the server" : reviewNeeded ? "No offline note was erased" : "Run the demo to compare all three copies"}</strong>
+          <strong>{resultVerified ? "Both tablets match the server" : reviewNeeded ? "The server kept the competing notes" : "Save and send your notes to compare the copies"}</strong>
           <p>
             {resultVerified
               ? "Tablet North, Tablet South, and PostgreSQL report the same record fingerprint."
