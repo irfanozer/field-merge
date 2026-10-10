@@ -72,11 +72,20 @@ The repository includes independent AWS and Azure deployment options. Both use
 GitHub Actions, immutable frontend and backend images, database migrations, and
 verification of HTTP, PostgreSQL, and WebSocket behavior before accepting a release.
 
-- [AWS deployment guide](docs/AWS_DEPLOYMENT.md): CloudFront, a private S3
+- [Cost-optimized AWS deployment](docs/AWS_ECONOMY.md): a smaller dedicated
+  server, tested memory limits, and swap on the existing disk. CloudFront,
+  private S3, PostgreSQL, backups and automated releases remain in place.
+  This option reduces recurring cost without combining the projects.
+- [Original AWS deployment guide](docs/AWS_DEPLOYMENT.md): CloudFront, a private S3
   frontend, and a separate warm EC2 server running the API and PostgreSQL.
   Includes passwordless GitHub access, backups, and a staged custom-domain switch.
 - [Azure deployment guide](docs/DEPLOYMENT.md): Azure Container Apps with one
   warm web replica and one warm API replica, plus private managed PostgreSQL.
+
+Both original AWS and Azure deployment structures are preserved. Economy releases
+use `AWS_ECONOMY_DEPLOYMENT_ENABLED=true` and `AWS_DEPLOYMENT_ENABLED=false`.
+The separate guarded resize tool changes infrastructure only when explicitly
+applied, after backups and runtime verification.
 
 No cloud resources are created merely by cloning or running the project. Follow
 the guide for your chosen provider above. The AWS guide includes the staged move
