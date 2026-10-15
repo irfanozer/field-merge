@@ -21,7 +21,7 @@ dev = [
   "aiosqlite>=0.20,<1",
   "httpx>=0.28,<1",
   "mypy>=1.14,<2",
-  "pytest>=8.3,<9",
+  "pytest>=8.3,<10",
   "pytest-asyncio>=0.25,<1",
   "ruff>=0.9,<1",
 ]
